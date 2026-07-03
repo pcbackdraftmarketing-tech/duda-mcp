@@ -53,11 +53,11 @@ def unpublish_site(site_name: str) -> dict:
 @mcp.tool()
 def duplicate_site(site_name: str, new_default_domain: str) -> dict:
     """Duplicate an existing Duda site."""
-    payload = {"new_default_domain": new_default_domain}
+    params = {"new_default_domain": new_default_domain}
     r = requests.post(
         f"{BASE_URL}/sites/multiscreen/duplicate/{site_name}",
         headers=HEADERS,
-        json=payload
+        params=params   # <-- query param, not json body
     )
     return r.json()
 
