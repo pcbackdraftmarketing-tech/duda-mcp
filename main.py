@@ -699,6 +699,84 @@ def create_site_from_existing(
         response["content_update_warning"] = content_warning
     return response
 
+# --- CLIENT / CONTENT COLLECTION --------------------------------------------
+
+@mcp.tool()
+def create_client_account(
+    site_name: str,
+    client_email: str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+) -> dict:
+    """
+    Create a client account and grant content collection access for a site.
+    After creation, retrieve the login link with get_content_collection_link.
+
+    Args:
+        site_name: The site_name ID to grant access to.
+        client_email: The client's email address (used as their username).
+        first_name: Optional client first name.
+        last_name: Optional client last name.
+    """
+    # Step 1: Create the account
+    payload: dict = {"account_name": client_email, "account_type": "CUSTOMER"}
+    if first_name:
+        payload["first_name"] = first_name
+    if last_name:
+        payload["last_name"] = last_name
+
+    result = _call("POST", "/accounts/create", json=payload)
+    if "_status_code" in result:
+        return {"error": "Failed to create client account.", "detail": result}
+
+    # Step 2: Grant content collection permissions
+    perms = _call(
+        "POST",
+        f"/accounts/permissions/multiscreen/{site_name}/client/{client_email}",
+        json={"permissions": ["CONTENT_LIBRARY_CONTENT"]},
+    )
+    if "_status_code" in perms:
+        return {
+            "error": "Account created but failed to grant permissions.",
+            "detail": perms,
+        }
+
+    return {
+        "success": True,
+        "account_name": client_email,
+        "site_name": site_name,
+        "message": "Client account created with content collection access. Call get_content_collection_link to get the form URL.",
+    }
+
+
+@mcp.tool()
+def get_content_collection_link(
+    site_name: str,
+    client_email: str,
+) -> dict:
+    """
+    Get the content collection form link to send to the client.
+    The client fills in this form to populate the site's Content Library.
+
+    Args:
+        site_name: The site_name ID.
+        client_email: The client's account email (created via create_client_account).
+    """
+    result = _call(
+        "GET",
+        f"/accounts/sso/{client_email}",
+        params={"site_name": site_name, "target": "CONTENT_LIBRARY"},
+    )
+    if "_status_code" in result:
+        return {"error": "Failed to get content collection link.", "detail": result}
+
+    return {
+        "site_name": site_name,
+        "client_email": client_email,
+        "link": result.get("url"),
+        "message": "Send this link to your client to fill in their business details.",
+    }
+
 
 # --- ANALYTICS --------------------------------------------------------------
 
