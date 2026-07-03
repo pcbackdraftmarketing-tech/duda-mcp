@@ -161,9 +161,9 @@ def _build_content_payload(
     loc: dict = {}
 
     if phone:
-        loc["phones"] = [{"phoneNumber": phone, "label": "Main"}]
+        loc["phones"] = [{"phoneNumber": phone, "label": "Phone"}]
     if email:
-        loc["emails"] = [{"emailAddress": email, "label": "Main"}]
+        loc["emails"] = [{"emailAddress": email, "label": "Email"}]
 
     addr: dict = {}
     if address:
