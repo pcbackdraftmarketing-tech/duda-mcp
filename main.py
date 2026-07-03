@@ -80,12 +80,37 @@ mcp = FastMCP("duda")
 
 
 @mcp.tool()
-def list_sites() -> dict:
+def list_sites(
+    limit: int = 75,
+    offset: int = 0,
+    label_names: Optional[str] = None,
+    publish_status: Optional[str] = None,
+) -> dict:
     """
-    List all sites in the Duda account.
-    Note: Duda may paginate large accounts; check '_status_code' on error.
+    List sites in the Duda account with pagination support.
+
+    Args:
+        limit: Number of sites to return per page (max 100, default 75).
+        offset: Zero-based offset for pagination. Increment by `limit` to get
+                the next page. Check `total_responses` in the result to know
+                when you've fetched all sites.
+        label_names: Optional comma-separated label names to filter by
+                     (e.g. 'template,restaurant'). Multiple values are OR'd.
+        publish_status: Optional filter — one of PUBLISHED, UNPUBLISHED, or
+                        NOT_PUBLISHED_YET. Multiple values comma-separated.
+
+    Example — fetch all sites in batches:
+        Page 1: list_sites(limit=100, offset=0)
+        Page 2: list_sites(limit=100, offset=100)
+        Page 3: list_sites(limit=100, offset=200)
+        Stop when len(results) < limit or offset >= total_responses.
     """
-    return _call("GET", "/sites/multiscreen")
+    params: dict = {"limit": min(limit, 100), "offset": offset}
+    if label_names:
+        params["label_names"] = label_names
+    if publish_status:
+        params["publish_status"] = publish_status
+    return _call("GET", "/sites/multiscreen", params=params)
 
 
 @mcp.tool()
@@ -122,11 +147,17 @@ def unpublish_site(site_name: str) -> dict:
 
 @mcp.tool()
 def duplicate_site(site_name: str, new_default_domain: str) -> dict:
-    """Duplicate an existing Duda site."""
+    """
+    Duplicate an existing Duda site.
+
+    Args:
+        site_name: The site_name ID of the site to duplicate.
+        new_default_domain: Subdomain prefix for the new site (e.g. 'client-abc').
+    """
     return _call(
         "POST",
         f"/sites/multiscreen/duplicate/{site_name}",
-        json={"new_default_domain": new_default_domain},
+        params={"new_default_domain": new_default_domain},
     )
 
 
@@ -194,41 +225,55 @@ def create_site_from_existing(
         template_site_name: site_name of the site to use as a template.
         new_default_domain: Subdomain prefix for the new site (e.g. 'client-name').
         business_name: Optional — pre-fill the business name in the content library.
-        phone: Optional — pre-fill the phone number.
+        phone: Optional — pre-fill the phone number (e.g. '555-123-4567').
         email: Optional — pre-fill the email address.
     """
-    # Step 1: Duplicate the site
+    # Step 1: Duplicate the site.
+    # new_default_domain must be sent as a query param, not a JSON body.
     new_site = _call(
         "POST",
         f"/sites/multiscreen/duplicate/{template_site_name}",
-        json={"new_default_domain": new_default_domain},
+        params={"new_default_domain": new_default_domain},
     )
     if "_status_code" in new_site:
         return {"error": new_site.get("raw_response", "Unknown error"), **new_site}
 
     new_site_name = new_site.get("site_name")
 
-    # Step 2: Optionally update business info in the content library
+    # Step 2: Optionally update business info in the content library.
+    # The content update endpoint returns 204 No Content on success (no JSON body).
+    # - business_name goes under business_data.name (not location_data)
+    # - phone goes under location_data.phones as an array of {phoneNumber, label}
+    # - email goes under location_data.emails as an array of {emailAddress, label}
     content_warning: Optional[str] = None
     if any([business_name, phone, email]):
-        business_info: dict = {}
-        if business_name:
-            business_info["business_name"] = business_name
-        if phone:
-            business_info["phone"] = phone
-        if email:
-            business_info["email"] = email
+        payload: dict = {}
 
-        content_result = _call(
-            "POST",
-            f"/sites/multiscreen/{new_site_name}/content",
-            json={"location_data": business_info},
+        if business_name:
+            payload["business_data"] = {"name": business_name}
+
+        location_data: dict = {}
+        if phone:
+            location_data["phones"] = [{"phoneNumber": phone, "label": "main"}]
+        if email:
+            location_data["emails"] = [{"emailAddress": email, "label": "main"}]
+        if location_data:
+            payload["location_data"] = location_data
+
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{new_site_name}/content",
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
         )
-        if "_status_code" in content_result:
+        # Success is 204 No Content — no JSON to parse
+        if not r.ok:
+            try:
+                err_body = r.json()
+            except ValueError:
+                err_body = r.text
             content_warning = (
                 f"Site created but content update failed "
-                f"(HTTP {content_result['_status_code']}): "
-                f"{content_result.get('raw_response', '')}"
+                f"(HTTP {r.status_code}): {err_body}"
             )
 
     response = {
@@ -242,6 +287,44 @@ def create_site_from_existing(
     if content_warning:
         response["content_update_warning"] = content_warning
     return response
+
+
+# --- CUSTOM TEMPLATE REGISTRY -----------------------------------------------
+
+# Edit this dict to map friendly names → site_name IDs of your template sites.
+# Run list_sites() to find the site_name for each template site you've built.
+# Naming convention tip: label your template sites in Duda with a "template"
+# label so list_sites(label_names="template") returns them automatically.
+CUSTOM_TEMPLATES: dict[str, str] = {
+    # "restaurant": "abc12345",
+    # "law-firm":   "def67890",
+    # "real-estate": "ghi11111",
+}
+
+
+@mcp.tool()
+def list_custom_templates() -> dict:
+    """
+    List your saved custom site templates (sites you've built and designated
+    as reusable starting points).
+
+    Returns a mapping of friendly template name → site_name ID.
+    Edit the CUSTOM_TEMPLATES dict in main.py to register your templates.
+
+    Tip: you can also use list_sites(label_names='template') to discover
+    template sites dynamically if you label them in the Duda dashboard.
+    """
+    if not CUSTOM_TEMPLATES:
+        return {
+            "message": (
+                "No custom templates registered yet. "
+                "Edit the CUSTOM_TEMPLATES dict in main.py, "
+                "or use list_sites(label_names='template') if you label "
+                "your template sites in the Duda dashboard."
+            ),
+            "templates": {},
+        }
+    return {"templates": CUSTOM_TEMPLATES}
 
 
 # --- ANALYTICS --------------------------------------------------------------
