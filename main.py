@@ -422,7 +422,7 @@ CUSTOM_TEMPLATES: dict[str, dict] = {
         "variants": [
             {
                 "id": "premier",
-                "site_name": "efe308d8",
+                "site_name": "ad3ea0ce",
                 "url": "https://www.premierplumbingwichita.com/",
                 "name": "Premier Plumbing Template",
                 "tagline": "Modern & Conversion-Focused",
