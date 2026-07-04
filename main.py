@@ -20,6 +20,9 @@ import requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 
+import anthropic as anthropic
+import json as _json
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -384,40 +387,249 @@ def create_site_from_template(
 
 # --- CUSTOM TEMPLATE REGISTRY -----------------------------------------------
 
-# Map friendly names → site_name IDs of your template sites.
-# Run list_sites(label_names="template") to discover them if you label
-# template sites in the Duda dashboard, then paste the site_name values here.
-CUSTOM_TEMPLATES: dict[str, str] = {
-    "plumbing": "efe308d8",
-    "home-care": "f9ab6bf6",
+# Map friendly collection names → template metadata dicts.
+#
+# Each entry supports MULTIPLE VARIANTS via the "variants" list.
+# Claude reads each variant's description and automatically picks the best
+# match based on the client brief — no manual selection needed.
+#
+# Structure:
+#   "collection-name": {
+#       "industry":    (required) industry vertical for filtering
+#       "description": (required) short summary of the collection
+#       "variants": [  (required) list of template variants
+#           {
+#               "site_name":   (required) Duda site_name ID
+#               "description": (required) detailed description Claude uses to
+#                              decide which variant fits the client best.
+#                              Be specific: mention style, colors, tone,
+#                              target market, layout, etc.
+#           },
+#           ...
+#       ]
+#   }
+#
+# Single-variant collections are supported — just add one item to "variants".
+#
+# To add a new template:
+#   1. Build the site in Duda and note its site_name ID
+#   2. Add a new variant dict under the relevant collection
+#   3. Write a detailed description so Claude can match it to client briefs
+
+CUSTOM_TEMPLATES: dict[str, dict] = {
+    "plumbing": {
+        "industry": "plumbing",
+        "description": "Professional plumbing website templates.",
+        "variants": [
+            {
+                "site_name": "efe308d8",
+                "description": (
+                    "Clean professional layout with a bold hero section. "
+                    "Best for established plumbing businesses that want a "
+                    "trustworthy, no-frills look. Works well for both urban "
+                    "and suburban markets."
+                ),
+            },
+            # Add more plumbing variants below:
+            # {
+            #     "site_name": "abc12345",
+            #     "description": (
+            #         "Dark modern theme with large imagery and bold typography. "
+            #         "Best for premium plumbing services targeting high-end urban clients."
+            #     ),
+            # },
+        ],
+    },
+    "home-care": {
+        "industry": "home-care",
+        "description": "Warm and professional home care website templates.",
+        "variants": [
+            {
+                "site_name": "f9ab6bf6",
+                "description": (
+                    "Warm, friendly design with soft colors and inviting imagery. "
+                    "Best for family-oriented home care agencies focused on "
+                    "elderly care or personal care services."
+                ),
+            },
+        ],
+    },
 }
 
 
 @mcp.tool()
-def list_custom_templates() -> dict:
+def list_custom_templates(industry: Optional[str] = None) -> dict:
     """
-    List your registered custom site templates (sites you've built and
-    designated as reusable starting points).
+    List all registered custom template collections with their variants and
+    descriptions. Claude uses this to intelligently pick the best variant
+    for a given client brief.
 
-    Returns a mapping of friendly template name → site_name ID.
-    Edit the CUSTOM_TEMPLATES dict in main.py to register your templates,
-    or use list_sites(label_names='template') to discover them dynamically
-    if you label template sites in the Duda dashboard.
+    Args:
+        industry: Optional filter — show only templates for a specific
+                  industry (e.g. 'plumbing', 'home-care'). Case-insensitive.
+                  Leave blank to list all templates.
+
+    Example prompts:
+        "List all plumbing templates"
+        "Which template should I use for a family-owned rural plumbing business?"
     """
     if not CUSTOM_TEMPLATES:
         return {
             "message": (
                 "No custom templates registered yet. "
-                "Edit the CUSTOM_TEMPLATES dict in main.py, "
-                "or use list_sites(label_names='template') if you label "
-                "your template sites in the Duda dashboard."
+                "Edit the CUSTOM_TEMPLATES dict in main.py to add templates."
             ),
             "templates": {},
         }
-    return {"templates": CUSTOM_TEMPLATES}
+
+    templates = CUSTOM_TEMPLATES
+
+    # Filter by industry if provided
+    if industry:
+        templates = {
+            name: meta for name, meta in CUSTOM_TEMPLATES.items()
+            if meta.get("industry", "").lower() == industry.lower()
+        }
+        if not templates:
+            return {
+                "message": f"No templates found for industry '{industry}'.",
+                "available_industries": sorted({
+    str(m["industry"]) for m in CUSTOM_TEMPLATES.values() if "industry" in m
+}),
+                "templates": {},
+            }
+
+    return {
+        "total_collections": len(templates),
+        "total_variants": sum(len(m.get("variants", [])) for m in templates.values()),
+        "collections": {
+            name: {
+                "industry": meta.get("industry", ""),
+                "description": meta.get("description", ""),
+                "variants": [
+                    {
+                        "site_name": v["site_name"],
+                        "description": v.get("description", ""),
+                    }
+                    for v in meta.get("variants", [])
+                ],
+            }
+            for name, meta in templates.items()
+        },
+    }
 
 
 # --- BUILD FROM CUSTOM TEMPLATE (main new feature) --------------------------
+
+@mcp.tool()
+def select_template_variant(
+    collection: str,
+    client_brief: str,
+) -> dict:
+    """
+    Intelligently select the best template variant from a collection based
+    on the client brief. Call this BEFORE build_site_from_custom_template
+    when a collection has multiple variants.
+
+    Claude reads all variant descriptions and picks the best match for the
+    client automatically — no manual selection needed.
+
+    Args:
+        collection:   Template collection name (e.g. 'plumbing', 'home-care').
+                      Use list_custom_templates() to see available collections.
+        client_brief: Short description of the client — business type, target
+                      market, style, location, tone, audience, etc.
+                      Example: "Family-owned plumbing in a rural town,
+                                traditional values, targeting older homeowners."
+
+    Returns:
+        The selected variant's site_name and reasoning. Pass the site_name
+        directly to build_site_from_custom_template.
+
+    Example prompts:
+        "Pick the best plumbing template for a high-end urban plumbing company"
+        "Which home-care variant suits a pediatric care agency?"
+    """
+
+    meta = CUSTOM_TEMPLATES.get(collection)
+    if not meta:
+        return {
+            "error": f"Collection '{collection}' not found.",
+            "available_collections": list(CUSTOM_TEMPLATES.keys()),
+        }
+
+    variants = meta.get("variants", [])
+    if not variants:
+        return {"error": f"Collection '{collection}' has no variants registered."}
+
+    # Single variant — no selection needed
+    if len(variants) == 1:
+        return {
+            "selected_site_name": variants[0]["site_name"],
+            "collection": collection,
+            "variant_description": variants[0].get("description", ""),
+            "reasoning": "Only one variant available in this collection.",
+            "total_variants_considered": 1,
+        }
+
+    # Build variants summary for the selection prompt
+    variants_text = "\n\n".join(
+        f"Variant {i + 1}:\n  site_name: {v['site_name']}\n  description: {v.get('description', 'No description')}"
+        for i, v in enumerate(variants)
+    )
+
+    prompt = f"""You are selecting the best website template variant for a client.
+
+Collection: {collection}
+Collection description: {meta.get('description', '')}
+
+Client brief:
+{client_brief}
+
+Available variants:
+{variants_text}
+
+Instructions:
+- Read each variant description carefully
+- Match the variant to the client brief based on style, tone, target market, and layout
+- Return ONLY valid JSON with no preamble or markdown fences:
+{{
+  "selected_site_name": "<site_name of the best variant>",
+  "variant_description": "<description of the chosen variant>",
+  "reasoning": "<1-2 sentences explaining why this variant fits the client>"
+}}"""
+
+    try:
+        _client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        message = _client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = message.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = _json.loads(raw.strip())
+    except Exception as e:
+        # Fallback to first variant if API call fails
+        return {
+            "selected_site_name": variants[0]["site_name"],
+            "collection": collection,
+            "variant_description": variants[0].get("description", ""),
+            "reasoning": f"Fallback to first variant due to selection error: {e}",
+            "total_variants_considered": len(variants),
+        }
+
+    return {
+        "selected_site_name": result.get("selected_site_name"),
+        "collection": collection,
+        "variant_description": result.get("variant_description", ""),
+        "reasoning": result.get("reasoning", ""),
+        "total_variants_considered": len(variants),
+    }
+
 
 
 @mcp.tool()
@@ -511,8 +723,23 @@ def build_site_from_custom_template(
         "Build a new plumbing site for Acme Plumbing — domain acme-plumbing,
          phone 555-999-0000, email info@acme.com, city Portland, region OR."
     """
-    # IMPROVEMENT #5: Resolve friendly name → raw site_name ID if needed.
-    resolved_template = CUSTOM_TEMPLATES.get(template_site_name, template_site_name)
+    # Resolve collection name → best variant site_name ID.
+    # Claude should call select_template_variant() first to get the best
+    # site_name ID for the client brief, then pass it here directly.
+    # If a collection name is passed, we fall back to the first variant.
+    # Raw site_name IDs (not in CUSTOM_TEMPLATES) are used as-is.
+    template_meta = CUSTOM_TEMPLATES.get(template_site_name)
+    if template_meta:
+        variants = template_meta.get("variants", [])
+        if not variants:
+            return {
+                "error": f"Template collection '{template_site_name}' has no variants registered.",
+            }
+        # Fallback to first variant — Claude should use select_template_variant first
+        resolved_template = variants[0]["site_name"]
+    else:
+        # Treat as a raw site_name ID (returned by select_template_variant)
+        resolved_template = template_site_name
 
     # ── Step 1: Duplicate the template ──────────────────────────────────────
     new_site = _call(
