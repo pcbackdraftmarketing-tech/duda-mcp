@@ -418,24 +418,63 @@ def create_site_from_template(
 CUSTOM_TEMPLATES: dict[str, dict] = {
     "plumbing": {
         "industry": "plumbing",
-        "description": "Professional plumbing website templates.",
+        "description": "Professional plumbing website templates. Choose based on client's brand personality and target audience.",
         "variants": [
             {
+                "id": "premier",
                 "site_name": "efe308d8",
+                "url": "https://www.premierplumbingwichita.com/",
+                "name": "Premier Plumbing Template",
+                "tagline": "Modern & Conversion-Focused",
                 "description": (
-                    "Clean professional layout with a bold hero section. "
-                    "Best for established plumbing businesses that want a "
-                    "trustworthy, no-frills look. Works well for both urban "
-                    "and suburban markets."
+                    "Streamlined, service-focused design with strong CTAs and same-day service emphasis. "
+                    "Professional yet approachable, with data-driven credibility markers. "
+                    "Best for growth-oriented plumbing companies wanting a modern, trustworthy presence "
+                    "that converts visitors quickly."
                 ),
+                "ideal_client": {
+                    "company_age": "0-20 years",
+                    "target_audience": "Suburban families, busy professionals",
+                    "brand_voice": "Professional, efficient, responsive",
+                    "key_priority": "Lead generation and quick conversions",
+                },
+                "design_vibe": "Modern, clean, action-oriented",
+            },
+            {
+                "id": "gad",
+                "site_name": "dfe8c020",
+                "url": "https://www.gadplumbing.com/",
+                "name": "GAD Plumbing Template",
+                "tagline": "Trusted & Legacy-Focused",
+                "description": (
+                    "Generational family business template. Warm, trust-focused layout with prominent "
+                    "history and community storytelling. Heavy use of badges, certifications, and real "
+                    "customer reviews. Best for established local plumbers with deep roots who want to "
+                    "emphasize legacy, reliability, and personal relationships with homeowners."
+                ),
+                "ideal_client": {
+                    "company_age": "20+ years",
+                    "target_audience": "Older homeowners, rural communities, families",
+                    "brand_voice": "Warm, trustworthy, experienced",
+                    "key_priority": "Building trust and long-term relationships",
+                },
+                "design_vibe": "Warm, traditional, community-rooted",
             },
             # Add more plumbing variants below:
             # {
-            #     "site_name": "abc12345",
-            #     "description": (
-            #         "Dark modern theme with large imagery and bold typography. "
-            #         "Best for premium plumbing services targeting high-end urban clients."
-            #     ),
+            #     "id": "my-template",
+            #     "site_name": "your_site_id",
+            #     "url": "https://preview-url.com",
+            #     "name": "Template Name",
+            #     "tagline": "Short tagline",
+            #     "description": "Detailed description for Claude to use when selecting.",
+            #     "ideal_client": {
+            #         "company_age": "...",
+            #         "target_audience": "...",
+            #         "brand_voice": "...",
+            #         "key_priority": "...",
+            #     },
+            #     "design_vibe": "...",
             # },
         ],
     },
@@ -444,12 +483,22 @@ CUSTOM_TEMPLATES: dict[str, dict] = {
         "description": "Warm and professional home care website templates.",
         "variants": [
             {
+                "id": "default",
                 "site_name": "f9ab6bf6",
+                "name": "Home Care Template",
+                "tagline": "Warm & Family-Focused",
                 "description": (
                     "Warm, friendly design with soft colors and inviting imagery. "
                     "Best for family-oriented home care agencies focused on "
                     "elderly care or personal care services."
                 ),
+                "ideal_client": {
+                    "company_age": "Any",
+                    "target_audience": "Families seeking care for elderly relatives",
+                    "brand_voice": "Compassionate, warm, trustworthy",
+                    "key_priority": "Building emotional trust with families",
+                },
+                "design_vibe": "Soft, warm, caring",
             },
         ],
     },
@@ -507,8 +556,14 @@ def list_custom_templates(industry: Optional[str] = None) -> dict:
                 "description": meta.get("description", ""),
                 "variants": [
                     {
+                        "id": v.get("id", ""),
                         "site_name": v["site_name"],
+                        "name": v.get("name", ""),
+                        "tagline": v.get("tagline", ""),
+                        "url": v.get("url", ""),
                         "description": v.get("description", ""),
+                        "ideal_client": v.get("ideal_client", {}),
+                        "design_vibe": v.get("design_vibe", ""),
                     }
                     for v in meta.get("variants", [])
                 ],
@@ -565,17 +620,33 @@ def select_template_variant(
     if len(variants) == 1:
         return {
             "selected_site_name": variants[0]["site_name"],
+            "selected_variant_name": variants[0].get("name", ""),
+            "selected_variant_id": variants[0].get("id", ""),
             "collection": collection,
-            "variant_description": variants[0].get("description", ""),
             "reasoning": "Only one variant available in this collection.",
             "total_variants_considered": 1,
         }
 
-    # Build variants summary for the selection prompt
-    variants_text = "\n\n".join(
-        f"Variant {i + 1}:\n  site_name: {v['site_name']}\n  description: {v.get('description', 'No description')}"
-        for i, v in enumerate(variants)
-    )
+    # Build a rich summary of each variant for the selection prompt
+    def _fmt_variant(i: int, v: dict) -> str:
+        lines = [f"Variant {i + 1}: {v.get('name', v['site_name'])}"]
+        if v.get("tagline"):
+            lines.append(f"  Tagline: {v['tagline']}")
+        if v.get("description"):
+            lines.append(f"  Description: {v['description']}")
+        if v.get("design_vibe"):
+            lines.append(f"  Design vibe: {v['design_vibe']}")
+        if v.get("ideal_client"):
+            ic = v["ideal_client"]
+            lines.append("  Ideal client:")
+            for k, val in ic.items():
+                lines.append(f"    {k}: {val}")
+        if v.get("url"):
+            lines.append(f"  Preview: {v['url']}")
+        lines.append(f"  site_name: {v['site_name']}")
+        return "\n".join(lines)
+
+    variants_text = "\n\n".join(_fmt_variant(i, v) for i, v in enumerate(variants))
 
     prompt = f"""You are selecting the best website template variant for a client.
 
@@ -589,13 +660,14 @@ Available variants:
 {variants_text}
 
 Instructions:
-- Read each variant description carefully
-- Match the variant to the client brief based on style, tone, target market, and layout
+- Carefully read each variant's description, design vibe, and ideal client profile
+- Match the best variant to the client brief considering style, tone, target market,
+  company age, brand voice, and key priorities
 - Return ONLY valid JSON with no preamble or markdown fences:
 {{
   "selected_site_name": "<site_name of the best variant>",
-  "variant_description": "<description of the chosen variant>",
-  "reasoning": "<1-2 sentences explaining why this variant fits the client>"
+  "selected_variant_name": "<name of the chosen variant>",
+  "reasoning": "<2-3 sentences explaining specifically why this variant fits the client brief>"
 }}"""
 
     try:
@@ -615,16 +687,23 @@ Instructions:
         # Fallback to first variant if API call fails
         return {
             "selected_site_name": variants[0]["site_name"],
+            "selected_variant_name": variants[0].get("name", ""),
+            "selected_variant_id": variants[0].get("id", ""),
             "collection": collection,
-            "variant_description": variants[0].get("description", ""),
             "reasoning": f"Fallback to first variant due to selection error: {e}",
             "total_variants_considered": len(variants),
         }
 
+    # Find the selected variant's full metadata to return
+    selected_meta = next(
+        (v for v in variants if v["site_name"] == result.get("selected_site_name")),
+        variants[0],
+    )
     return {
         "selected_site_name": result.get("selected_site_name"),
+        "selected_variant_name": selected_meta.get("name", ""),
+        "selected_variant_id": selected_meta.get("id", ""),
         "collection": collection,
-        "variant_description": result.get("variant_description", ""),
         "reasoning": result.get("reasoning", ""),
         "total_variants_considered": len(variants),
     }
