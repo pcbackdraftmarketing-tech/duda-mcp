@@ -16,12 +16,11 @@ import os
 from datetime import datetime
 from typing import Any, Literal, Optional
 
+import json
+import anthropic
 import requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-
-import anthropic as anthropic
-import json as _json
 
 load_dotenv()
 
@@ -494,8 +493,8 @@ def list_custom_templates(industry: Optional[str] = None) -> dict:
             return {
                 "message": f"No templates found for industry '{industry}'.",
                 "available_industries": sorted({
-    str(m["industry"]) for m in CUSTOM_TEMPLATES.values() if "industry" in m
-}),
+                    str(m["industry"]) for m in CUSTOM_TEMPLATES.values() if "industry" in m
+                }),
                 "templates": {},
             }
 
@@ -611,7 +610,7 @@ Instructions:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        result = _json.loads(raw.strip())
+        result = json.loads(raw.strip())
     except Exception as e:
         # Fallback to first variant if API call fails
         return {
