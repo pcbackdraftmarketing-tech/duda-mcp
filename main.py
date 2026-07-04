@@ -56,9 +56,20 @@ def _call(method: str, path: str, **kwargs) -> dict:
     """
     Make an authenticated request to the Duda API.
     Always returns a dict; includes '_status_code' on non-2xx responses.
+
+    FIX #7: Added timeout and connection error handling so tools never crash
+    with an unhandled exception on network issues.
     """
     kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
-    r = session.request(method, f"{BASE_URL}{path}", **kwargs)
+    try:
+        r = session.request(method, f"{BASE_URL}{path}", **kwargs)
+    except requests.Timeout:
+        return {"error": "Request timed out. Duda API did not respond in time.", "_status_code": 504}
+    except requests.ConnectionError:
+        return {"error": "Connection error. Could not reach the Duda API.", "_status_code": 503}
+    except requests.RequestException as e:
+        return {"error": str(e), "_status_code": 500}
+
     data: dict[str, Any]
     try:
         data = r.json()
@@ -75,11 +86,14 @@ def _update_content(site_name: str, payload: dict) -> tuple[bool, Optional[str]]
     Returns (success: bool, error_message: str | None).
     The endpoint returns 204 No Content on success — no JSON body.
     """
-    r = session.post(
-        f"{BASE_URL}/sites/multiscreen/{site_name}/content",
-        json=payload,
-        timeout=DEFAULT_TIMEOUT,
-    )
+    try:
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{site_name}/content",
+            json=payload,
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return False, str(e)
     if r.ok:
         return True, None
     try:
@@ -94,10 +108,13 @@ def _publish_content(site_name: str) -> tuple[bool, Optional[str]]:
     Push content library changes to the live published site.
     Required after updating content on an already-published site.
     """
-    r = session.post(
-        f"{BASE_URL}/sites/multiscreen/{site_name}/content/publish",
-        timeout=DEFAULT_TIMEOUT,
-    )
+    try:
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{site_name}/content/publish",
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return False, str(e)
     if r.ok:
         return True, None
     return False, f"HTTP {r.status_code}: {r.text}"
@@ -194,12 +211,10 @@ def _build_content_payload(
 
     # --- site_texts ----------------------------------------------------------
     if custom_texts:
-        # custom_texts expected as [{"label": "...", "text": "..."}, ...]
         payload["site_texts"] = {"custom": custom_texts}
 
     # --- site_images ---------------------------------------------------------
     if site_images:
-        # site_images expected as [{"label": "...", "url": "...", "alt": "..."}, ...]
         payload["site_images"] = site_images
 
     return payload
@@ -221,6 +236,7 @@ def list_sites(
     offset: int = 0,
     label_names: Optional[str] = None,
     publish_status: Optional[str] = None,
+    site_type: Optional[str] = None,
 ) -> dict:
     """
     List sites in the Duda account with pagination support.
@@ -234,17 +250,22 @@ def list_sites(
                      (e.g. 'template,restaurant'). Values are OR'd.
         publish_status: Optional filter — PUBLISHED, UNPUBLISHED, or
                         NOT_PUBLISHED_YET. Multiple values comma-separated.
+        site_type: Optional filter — REGULAR to show only regular sites,
+                   TEMPLATE to show only template sites.
 
-    Tip — fetch all 422 sites in batches:
+    Tip — fetch all sites in batches:
         Page 1: list_sites(limit=100, offset=0)
         Page 2: list_sites(limit=100, offset=100)
         ...stop when len(results) < limit or offset >= total_responses.
     """
+    # FIX #6: Added site_type filter to allow filtering regular vs template sites.
     params: dict = {"limit": min(limit, 100), "offset": offset}
     if label_names:
         params["label_names"] = label_names
     if publish_status:
         params["publish_status"] = publish_status
+    if site_type:
+        params["site_type"] = site_type
     return _call("GET", "/sites/multiscreen", params=params)
 
 
@@ -257,21 +278,43 @@ def get_site(site_name: str) -> dict:
 @mcp.tool()
 def publish_site(site_name: str) -> dict:
     """Publish a Duda site to make it live."""
-    r = session.post(
-        f"{BASE_URL}/sites/multiscreen/{site_name}/publish",
-        timeout=DEFAULT_TIMEOUT,
-    )
+    try:
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{site_name}/publish",
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"status_code": 500, "message": str(e)}
     return {"status_code": r.status_code, "message": "Published" if r.ok else r.text}
 
 
 @mcp.tool()
 def unpublish_site(site_name: str) -> dict:
     """Unpublish (take offline) a Duda site."""
-    r = session.post(
-        f"{BASE_URL}/sites/multiscreen/{site_name}/unpublish",
-        timeout=DEFAULT_TIMEOUT,
-    )
+    try:
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{site_name}/unpublish",
+            timeout=DEFAULT_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"status_code": 500, "message": str(e)}
     return {"status_code": r.status_code, "message": "Unpublished" if r.ok else r.text}
+
+
+@mcp.tool()
+def delete_site(site_name: str) -> dict:
+    """
+    Permanently delete a Duda site. Use with caution — this cannot be undone.
+
+    Args:
+        site_name: The site_name ID of the site to delete.
+
+    IMPROVEMENT #10: Added delete_site tool for cleanup after testing.
+    """
+    result = _call("DELETE", f"/sites/multiscreen/{site_name}")
+    if "_status_code" in result:
+        return {"deleted": False, "error": result}
+    return {"deleted": True, "site_name": site_name}
 
 
 @mcp.tool()
@@ -330,10 +373,12 @@ def create_site_from_template(
         payload["site_data"] = site_data
 
     result = _call("POST", "/sites/multiscreen/create", json=payload)
+
+    # FIX #2: Guard against None site_name in edit_url
     if "_status_code" not in result:
-        result["edit_url"] = (
-            f"https://dashboard.duda.co/home/site/{result.get('site_name')}"
-        )
+        site_name = result.get("site_name")
+        if site_name:
+            result["edit_url"] = f"https://dashboard.duda.co/home/site/{site_name}"
     return result
 
 
@@ -424,9 +469,8 @@ def build_site_from_custom_template(
     content stays in place for that field.
 
     Args:
-        template_site_name: site_name ID of your custom template site.
-                            Use list_custom_templates() or
-                            list_sites(label_names='template') to find these.
+        template_site_name: Friendly name (e.g. 'plumbing') OR raw site_name ID.
+                            Use list_custom_templates() to see available names.
         new_default_domain: Subdomain prefix for the new site (e.g. 'acme-plumbing').
         business_name:  Client's business name.
         description:    Short business description / tagline.
@@ -464,15 +508,16 @@ def build_site_from_custom_template(
         and any warnings from the content or publish steps.
 
     Example prompt to Claude Desktop:
-        "Build a new restaurant site from my restaurant template for
-         Joe's Diner — domain joe-diner, phone 555-999-0000,
-         email info@joesdiner.com, address 88 Oak Street, city Portland,
-         region OR, postal 97201."
+        "Build a new plumbing site for Acme Plumbing — domain acme-plumbing,
+         phone 555-999-0000, email info@acme.com, city Portland, region OR."
     """
+    # IMPROVEMENT #5: Resolve friendly name → raw site_name ID if needed.
+    resolved_template = CUSTOM_TEMPLATES.get(template_site_name, template_site_name)
+
     # ── Step 1: Duplicate the template ──────────────────────────────────────
     new_site = _call(
         "POST",
-        f"/sites/multiscreen/duplicate/{template_site_name}",
+        f"/sites/multiscreen/duplicate/{resolved_template}",
         params={"new_default_domain": new_default_domain},
     )
     if "_status_code" in new_site:
@@ -482,7 +527,13 @@ def build_site_from_custom_template(
             "_status_code": new_site["_status_code"],
         }
 
-    new_site_name: str = new_site.get("site_name", "")
+    # FIX #1: Explicit guard — fail clearly if site_name is missing.
+    new_site_name = new_site.get("site_name")
+    if not new_site_name:
+        return {
+            "error": "Duplicate succeeded but site_name was missing from response.",
+            "raw": new_site,
+        }
 
     # ── Step 2: Build and inject content payload ─────────────────────────────
     content_payload = _build_content_payload(
@@ -531,7 +582,7 @@ def build_site_from_custom_template(
         "edit_url": f"https://dashboard.duda.co/home/site/{new_site_name}",
         "preview_url": f"https://dashboard.duda.co/preview/{new_site_name}",
         "status": "created",
-        "template_source": template_site_name,
+        "template_source": resolved_template,
         "content_injected": content_injected,
         "fields_sent": list(content_payload.keys()) if content_payload else [],
     }
@@ -664,7 +715,6 @@ def create_site_from_existing(
         phone: Optional — pre-fill the phone number.
         email: Optional — pre-fill the email address.
     """
-    
     new_site = _call(
         "POST",
         f"/sites/multiscreen/duplicate/{template_site_name}",
@@ -673,8 +723,13 @@ def create_site_from_existing(
     if "_status_code" in new_site:
         return {"error": new_site.get("raw_response", "Unknown error"), **new_site}
 
-
-    new_site_name: str = new_site.get("site_name", "")
+    # FIX #8: Explicit guard — same as build_site_from_custom_template.
+    new_site_name = new_site.get("site_name")
+    if not new_site_name:
+        return {
+            "error": "Duplicate succeeded but site_name was missing from response.",
+            "raw": new_site,
+        }
 
     content_warning: Optional[str] = None
     if any([business_name, phone, email]):
@@ -698,6 +753,7 @@ def create_site_from_existing(
     if content_warning:
         response["content_update_warning"] = content_warning
     return response
+
 
 # --- CLIENT / CONTENT COLLECTION --------------------------------------------
 
@@ -726,8 +782,12 @@ def create_client_account(
         payload["last_name"] = last_name
 
     result = _call("POST", "/accounts/create", json=payload)
+
+    # FIX #4: If account already exists (400), still proceed to grant permissions.
     if "_status_code" in result:
-        return {"error": "Failed to create client account.", "detail": result}
+        if result.get("_status_code") != 400:
+            return {"error": "Failed to create client account.", "detail": result}
+        # 400 = account already exists — safe to continue to permissions step
 
     # Step 2: Grant content collection permissions
     perms = _call(
@@ -762,10 +822,12 @@ def get_content_collection_link(
         site_name: The site_name ID.
         client_email: The client's account email (created via create_client_account).
     """
+    # FIX #3: Corrected SSO target from "CONTENT_LIBRARY" to "CONTENT_COLLECTION"
+    # per Duda's SSO documentation.
     result = _call(
         "GET",
         f"/accounts/sso/{client_email}",
-        params={"site_name": site_name, "target": "CONTENT_LIBRARY"},
+        params={"site_name": site_name, "target": "CONTENT_COLLECTION"},
     )
     if "_status_code" in result:
         return {"error": "Failed to get content collection link.", "detail": result}
