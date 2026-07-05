@@ -1,0 +1,78 @@
+# ============================================================================
+# Duda custom template registry
+# ============================================================================
+# Add a new template by adding a new collection block below, or a new entry
+# under `variants:` in an existing collection. No Python edits needed — save
+# the file and call the `reload_custom_templates` MCP tool (no server restart
+# required).
+#
+# Required fields:
+#   Collection:  industry, variants (non-empty list)
+#   Variant:     site_name
+#
+# Recommended fields (used by Claude to pick the best variant for a client):
+#   id, name, tagline, description, design_vibe, ideal_client, url
+#
+# Tip: keep `description` and `ideal_client` rich and specific — that's what
+# Claude reads to match a client brief to the right variant.
+# ============================================================================
+
+plumbing:
+  industry: plumbing
+  description: >-
+    Professional plumbing website templates. Choose based on client's brand
+    personality and target audience.
+  variants:
+    - id: premier
+      site_name: ad3ea0ce
+      url: https://www.premierplumbingwichita.com/
+      name: Premier Plumbing Template
+      tagline: Modern & Conversion-Focused
+      description: >-
+        Streamlined, service-focused design with strong CTAs and same-day
+        service emphasis. Professional yet approachable, with data-driven
+        credibility markers. Best for growth-oriented plumbing companies
+        wanting a modern, trustworthy presence that converts visitors quickly.
+      ideal_client:
+        company_age: 0-20 years
+        target_audience: Suburban families, busy professionals
+        brand_voice: Professional, efficient, responsive
+        key_priority: Lead generation and quick conversions
+      design_vibe: Modern, clean, action-oriented
+
+    - id: gad
+      site_name: dfe8c020
+      url: https://www.gadplumbing.com/
+      name: GAD Plumbing Template
+      tagline: Trusted & Legacy-Focused
+      description: >-
+        Generational family business template. Warm, trust-focused layout with
+        prominent history and community storytelling. Heavy use of badges,
+        certifications, and real customer reviews. Best for established local
+        plumbers with deep roots who want to emphasize legacy, reliability,
+        and personal relationships with homeowners.
+      ideal_client:
+        company_age: 20+ years
+        target_audience: Older homeowners, rural communities, families
+        brand_voice: Warm, trustworthy, experienced
+        key_priority: Building trust and long-term relationships
+      design_vibe: Warm, traditional, community-rooted
+
+home-care:
+  industry: home-care
+  description: Warm and professional home care website templates.
+  variants:
+    - id: default
+      site_name: f9ab6bf6
+      name: Home Care Template
+      tagline: Warm & Family-Focused
+      description: >-
+        Warm, friendly design with soft colors and inviting imagery. Best for
+        family-oriented home care agencies focused on elderly care or personal
+        care services.
+      ideal_client:
+        company_age: Any
+        target_audience: Families seeking care for elderly relatives
+        brand_voice: Compassionate, warm, trustworthy
+        key_priority: Building emotional trust with families
+      design_vibe: Soft, warm, caring

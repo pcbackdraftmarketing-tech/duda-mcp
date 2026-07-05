@@ -4,23 +4,36 @@ Duda MCP Server
 Exposes Duda website-management operations as MCP tools via FastMCP.
 
 Required environment variables (set in a .env file or the process environment):
-    DUDA_API_USER   — your Duda API username
-    DUDA_API_PASS   — your Duda API password
+    DUDA_API_USER         — your Duda API username
+    DUDA_API_PASS         — your Duda API password
+    ANTHROPIC_API_KEY     — (optional) enables LLM-based template variant selection
+    ANTHROPIC_MODEL       — (optional) model id for variant selection
+                            (default: 'claude-sonnet-4-6')
+    DUDA_TEMPLATES_FILE   — (optional) path to the template registry YAML.
+                            Defaults to 'templates.yaml' next to this file.
+                            Edit that file to add templates and call the
+                            `reload_custom_templates` MCP tool to pick up
+                            changes without restarting the server.
 
 Usage:
     python main.py
 """
 
 import base64
+import json
 import os
+import re
+import sys
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-import json
 import anthropic
 import requests
+import yaml
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 load_dotenv()
 
@@ -39,15 +52,47 @@ if not USERNAME or not PASSWORD:
 creds = base64.b64encode(f"{USERNAME}:{PASSWORD}".encode()).decode()
 
 session = requests.Session()
-session.headers.update(
-    {
-        "Authorization": f"Basic {creds}",
-        "Content-Type": "application/json",
-    }
+# POST-REVIEW FIX: dropped the session-level 'Content-Type: application/json' —
+# requests sets it automatically when json=... is passed, and sending it on
+# bodyless GETs was technically incorrect.
+session.headers.update({"Authorization": f"Basic {creds}"})
+
+# POST-REVIEW FIX: retry on transient 429/5xx with exponential backoff so a
+# single hiccup on Duda's side doesn't break a whole build workflow.
+_retry = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 502, 503, 504],
+    allowed_methods=["GET", "POST", "PUT", "DELETE"],
+    raise_on_status=False,
 )
+session.mount("https://", HTTPAdapter(max_retries=_retry))
 
 BASE_URL = "https://api.duda.co/api"
-DEFAULT_TIMEOUT = 15  # seconds
+DEFAULT_TIMEOUT = 15   # seconds — for light reads
+# POST-REVIEW FIX: duplicate/publish/content operations routinely take
+# 20-40s on Duda's side. 15s was too tight.
+LONG_TIMEOUT = 60      # seconds — for duplicate, publish, and content updates
+
+# ---------------------------------------------------------------------------
+# Anthropic client (module-level, lazy) — used by select_template_variant
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+_anthropic_client: Optional[anthropic.Anthropic] = None
+
+
+def _get_anthropic_client() -> Optional[anthropic.Anthropic]:
+    """Lazy-init a module-scoped Anthropic client. Returns None if no key set."""
+    global _anthropic_client
+    if _anthropic_client is not None:
+        return _anthropic_client
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    _anthropic_client = anthropic.Anthropic(api_key=api_key)
+    return _anthropic_client
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -59,8 +104,11 @@ def _call(method: str, path: str, **kwargs) -> dict:
     Make an authenticated request to the Duda API.
     Always returns a dict; includes '_status_code' on non-2xx responses.
 
-    FIX #7: Added timeout and connection error handling so tools never crash
-    with an unhandled exception on network issues.
+    Callers can override the timeout via kwargs (e.g. timeout=LONG_TIMEOUT).
+
+    FIX #7: timeout/connection error handling so tools never crash on network issues.
+    POST-REVIEW FIX: guard against non-dict JSON payloads (arrays, strings, null)
+    which previously caused TypeError when we tried to attach _status_code.
     """
     kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
     try:
@@ -72,11 +120,19 @@ def _call(method: str, path: str, **kwargs) -> dict:
     except requests.RequestException as e:
         return {"error": str(e), "_status_code": 500}
 
-    data: dict[str, Any]
+    # Try JSON, but coerce non-dict payloads into a dict wrapper so callers
+    # can always rely on a dict-shaped response.
     try:
-        data = r.json()
+        parsed = r.json()
     except ValueError:
-        data = {"raw_response": r.text}
+        parsed = None
+
+    if isinstance(parsed, dict):
+        data: dict[str, Any] = parsed
+    else:
+        # Non-dict JSON (list, string, number, null) or unparseable body
+        data = {"raw_response": parsed if parsed is not None else r.text}
+
     if not r.ok:
         data["_status_code"] = r.status_code
     return data
@@ -92,7 +148,7 @@ def _update_content(site_name: str, payload: dict) -> tuple[bool, Optional[str]]
         r = session.post(
             f"{BASE_URL}/sites/multiscreen/{site_name}/content",
             json=payload,
-            timeout=DEFAULT_TIMEOUT,
+            timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: was DEFAULT_TIMEOUT
         )
     except requests.RequestException as e:
         return False, str(e)
@@ -113,7 +169,7 @@ def _publish_content(site_name: str) -> tuple[bool, Optional[str]]:
     try:
         r = session.post(
             f"{BASE_URL}/sites/multiscreen/{site_name}/content/publish",
-            timeout=DEFAULT_TIMEOUT,
+            timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: was DEFAULT_TIMEOUT
         )
     except requests.RequestException as e:
         return False, str(e)
@@ -222,6 +278,113 @@ def _build_content_payload(
     return payload
 
 
+def _duplicate_and_inject(
+    source_site_name: str,
+    new_default_domain: str,
+    content_payload: dict,
+    publish_content: bool,
+) -> dict:
+    """
+    POST-REVIEW FIX: shared workflow extracted from build_site_from_custom_template
+    and create_site_from_existing. Duplicates a site, optionally injects content
+    into its Content Library, and optionally publishes the content changes.
+
+    Returned dict includes an '_error' key when the duplicate step itself failed
+    so callers can short-circuit and forward the error to the client.
+    """
+    new_site = _call(
+        "POST",
+        f"/sites/multiscreen/duplicate/{source_site_name}",
+        params={"new_default_domain": new_default_domain},
+        timeout=LONG_TIMEOUT,
+    )
+    if "_status_code" in new_site:
+        return {
+            "_error": True,
+            "error": "Failed to duplicate template site.",
+            "detail": new_site.get("raw_response", new_site),
+            "_status_code": new_site["_status_code"],
+        }
+
+    new_site_name = new_site.get("site_name")
+    if not new_site_name:
+        return {
+            "_error": True,
+            "error": "Duplicate succeeded but site_name was missing from response.",
+            "raw": new_site,
+        }
+
+    content_injected = False
+    content_status: str
+    content_warning: Optional[str] = None
+
+    if content_payload:
+        ok, err = _update_content(new_site_name, content_payload)
+        if ok:
+            content_injected = True
+            content_status = "injected"
+        else:
+            content_status = "failed"
+            content_warning = f"Site created but content injection failed: {err}"
+    else:
+        # POST-REVIEW FIX: distinguish "no content requested" from "content
+        # injection failed". content_injected=False alone was ambiguous.
+        content_status = "no_fields_provided"
+
+    publish_warning: Optional[str] = None
+    if publish_content and content_injected:
+        pub_ok, pub_err = _publish_content(new_site_name)
+        if not pub_ok:
+            publish_warning = f"Content injected but publish-content failed: {pub_err}"
+
+    result: dict = {
+        "site_name": new_site_name,
+        "default_domain": new_site.get("site_default_domain"),
+        "edit_url": f"https://dashboard.duda.co/home/site/{new_site_name}",
+        "preview_url": f"https://dashboard.duda.co/preview/{new_site_name}",
+        "status": "created",
+        "content_injected": content_injected,
+        "content_status": content_status,
+        "fields_sent": list(content_payload.keys()) if content_payload else [],
+    }
+    if content_warning:
+        result["content_warning"] = content_warning
+    if publish_warning:
+        result["publish_warning"] = publish_warning
+    return result
+
+
+def _fmt_variant(i: int, v: dict) -> str:
+    """Format one template variant for the selection prompt.
+    POST-REVIEW FIX: pulled out of select_template_variant to module scope."""
+    lines = [f"Variant {i + 1}: {v.get('name', v['site_name'])}"]
+    if v.get("tagline"):
+        lines.append(f"  Tagline: {v['tagline']}")
+    if v.get("description"):
+        lines.append(f"  Description: {v['description']}")
+    if v.get("design_vibe"):
+        lines.append(f"  Design vibe: {v['design_vibe']}")
+    if v.get("ideal_client"):
+        ic = v["ideal_client"]
+        lines.append("  Ideal client:")
+        for k, val in ic.items():
+            lines.append(f"    {k}: {val}")
+    if v.get("url"):
+        lines.append(f"  Preview: {v['url']}")
+    lines.append(f"  site_name: {v['site_name']}")
+    return "\n".join(lines)
+
+
+def _extract_json_object(raw: str) -> dict:
+    """Robustly pull the first JSON object out of a model response.
+    POST-REVIEW FIX: replaces the fragile ```json fence stripping which broke
+    on unclosed fences and stray backticks inside reasoning text."""
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON object found in model response.")
+    return json.loads(match.group(0))
+
+
 # ---------------------------------------------------------------------------
 # MCP server
 # ---------------------------------------------------------------------------
@@ -260,8 +423,12 @@ def list_sites(
         Page 2: list_sites(limit=100, offset=100)
         ...stop when len(results) < limit or offset >= total_responses.
     """
-    # FIX #6: Added site_type filter to allow filtering regular vs template sites.
-    params: dict = {"limit": min(limit, 100), "offset": offset}
+    # FIX #6: site_type filter to allow filtering regular vs template sites.
+    # POST-REVIEW FIX: clamp lower bounds on limit/offset.
+    params: dict = {
+        "limit": max(1, min(limit, 100)),
+        "offset": max(0, offset),
+    }
     if label_names:
         params["label_names"] = label_names
     if publish_status:
@@ -283,7 +450,7 @@ def publish_site(site_name: str) -> dict:
     try:
         r = session.post(
             f"{BASE_URL}/sites/multiscreen/{site_name}/publish",
-            timeout=DEFAULT_TIMEOUT,
+            timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: was DEFAULT_TIMEOUT
         )
     except requests.RequestException as e:
         return {"status_code": 500, "message": str(e)}
@@ -296,7 +463,7 @@ def unpublish_site(site_name: str) -> dict:
     try:
         r = session.post(
             f"{BASE_URL}/sites/multiscreen/{site_name}/unpublish",
-            timeout=DEFAULT_TIMEOUT,
+            timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: was DEFAULT_TIMEOUT
         )
     except requests.RequestException as e:
         return {"status_code": 500, "message": str(e)}
@@ -311,7 +478,7 @@ def delete_site(site_name: str) -> dict:
     Args:
         site_name: The site_name ID of the site to delete.
 
-    IMPROVEMENT #10: Added delete_site tool for cleanup after testing.
+    IMPROVEMENT #10: delete_site tool for cleanup after testing.
     """
     result = _call("DELETE", f"/sites/multiscreen/{site_name}")
     if "_status_code" in result:
@@ -332,6 +499,7 @@ def duplicate_site(site_name: str, new_default_domain: str) -> dict:
         "POST",
         f"/sites/multiscreen/duplicate/{site_name}",
         params={"new_default_domain": new_default_domain},
+        timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: duplication can take 30s+
     )
 
 
@@ -374,7 +542,12 @@ def create_site_from_template(
     if site_data:
         payload["site_data"] = site_data
 
-    result = _call("POST", "/sites/multiscreen/create", json=payload)
+    result = _call(
+        "POST",
+        "/sites/multiscreen/create",
+        json=payload,
+        timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: template creation can take 30s+
+    )
 
     # FIX #2: Guard against None site_name in edit_url
     if "_status_code" not in result:
@@ -385,124 +558,106 @@ def create_site_from_template(
 
 
 # --- CUSTOM TEMPLATE REGISTRY -----------------------------------------------
+#
+# CUSTOM_TEMPLATES is loaded at startup from a YAML file so non-developers
+# can add templates without editing Python. Default location is
+# 'templates.yaml' next to this file; override via DUDA_TEMPLATES_FILE.
+#
+# YAML schema:
+#   collection-name:
+#     industry:    <required>  short industry slug (e.g. "plumbing")
+#     description: <optional>  short summary of the collection
+#     variants:                non-empty list
+#       - site_name:    <required>  Duda site_name ID
+#         id:           <optional>  short slug
+#         name:         <optional>  human-readable label
+#         tagline:      <optional>  short pitch
+#         description:  <optional>  detailed prose Claude uses when picking
+#         design_vibe:  <optional>  short style descriptor
+#         url:          <optional>  preview URL
+#         ideal_client: <optional>  free-form mapping (company_age,
+#                                   target_audience, brand_voice, ...)
+#
+# Add or edit templates by editing the YAML file, then call the
+# `reload_custom_templates` MCP tool — no server restart required. Validation
+# runs on every load, so a malformed file is rejected with a clear error and
+# the in-memory registry is left untouched.
 
-# Map friendly collection names → template metadata dicts.
-#
-# Each entry supports MULTIPLE VARIANTS via the "variants" list.
-# Claude reads each variant's description and automatically picks the best
-# match based on the client brief — no manual selection needed.
-#
-# Structure:
-#   "collection-name": {
-#       "industry":    (required) industry vertical for filtering
-#       "description": (required) short summary of the collection
-#       "variants": [  (required) list of template variants
-#           {
-#               "site_name":   (required) Duda site_name ID
-#               "description": (required) detailed description Claude uses to
-#                              decide which variant fits the client best.
-#                              Be specific: mention style, colors, tone,
-#                              target market, layout, etc.
-#           },
-#           ...
-#       ]
-#   }
-#
-# Single-variant collections are supported — just add one item to "variants".
-#
-# To add a new template:
-#   1. Build the site in Duda and note its site_name ID
-#   2. Add a new variant dict under the relevant collection
-#   3. Write a detailed description so Claude can match it to client briefs
+DEFAULT_TEMPLATES_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "templates.yaml",
+)
+TEMPLATES_FILE = os.environ.get("DUDA_TEMPLATES_FILE", DEFAULT_TEMPLATES_FILE)
 
-CUSTOM_TEMPLATES: dict[str, dict] = {
-    "plumbing": {
-        "industry": "plumbing",
-        "description": "Professional plumbing website templates. Choose based on client's brand personality and target audience.",
-        "variants": [
-            {
-                "id": "premier",
-                "site_name": "ad3ea0ce",
-                "url": "https://www.premierplumbingwichita.com/",
-                "name": "Premier Plumbing Template",
-                "tagline": "Modern & Conversion-Focused",
-                "description": (
-                    "Streamlined, service-focused design with strong CTAs and same-day service emphasis. "
-                    "Professional yet approachable, with data-driven credibility markers. "
-                    "Best for growth-oriented plumbing companies wanting a modern, trustworthy presence "
-                    "that converts visitors quickly."
-                ),
-                "ideal_client": {
-                    "company_age": "0-20 years",
-                    "target_audience": "Suburban families, busy professionals",
-                    "brand_voice": "Professional, efficient, responsive",
-                    "key_priority": "Lead generation and quick conversions",
-                },
-                "design_vibe": "Modern, clean, action-oriented",
-            },
-            {
-                "id": "gad",
-                "site_name": "dfe8c020",
-                "url": "https://www.gadplumbing.com/",
-                "name": "GAD Plumbing Template",
-                "tagline": "Trusted & Legacy-Focused",
-                "description": (
-                    "Generational family business template. Warm, trust-focused layout with prominent "
-                    "history and community storytelling. Heavy use of badges, certifications, and real "
-                    "customer reviews. Best for established local plumbers with deep roots who want to "
-                    "emphasize legacy, reliability, and personal relationships with homeowners."
-                ),
-                "ideal_client": {
-                    "company_age": "20+ years",
-                    "target_audience": "Older homeowners, rural communities, families",
-                    "brand_voice": "Warm, trustworthy, experienced",
-                    "key_priority": "Building trust and long-term relationships",
-                },
-                "design_vibe": "Warm, traditional, community-rooted",
-            },
-            # Add more plumbing variants below:
-            # {
-            #     "id": "my-template",
-            #     "site_name": "your_site_id",
-            #     "url": "https://preview-url.com",
-            #     "name": "Template Name",
-            #     "tagline": "Short tagline",
-            #     "description": "Detailed description for Claude to use when selecting.",
-            #     "ideal_client": {
-            #         "company_age": "...",
-            #         "target_audience": "...",
-            #         "brand_voice": "...",
-            #         "key_priority": "...",
-            #     },
-            #     "design_vibe": "...",
-            # },
-        ],
-    },
-    "home-care": {
-        "industry": "home-care",
-        "description": "Warm and professional home care website templates.",
-        "variants": [
-            {
-                "id": "default",
-                "site_name": "f9ab6bf6",
-                "name": "Home Care Template",
-                "tagline": "Warm & Family-Focused",
-                "description": (
-                    "Warm, friendly design with soft colors and inviting imagery. "
-                    "Best for family-oriented home care agencies focused on "
-                    "elderly care or personal care services."
-                ),
-                "ideal_client": {
-                    "company_age": "Any",
-                    "target_audience": "Families seeking care for elderly relatives",
-                    "brand_voice": "Compassionate, warm, trustworthy",
-                    "key_priority": "Building emotional trust with families",
-                },
-                "design_vibe": "Soft, warm, caring",
-            },
-        ],
-    },
-}
+
+def _validate_templates(data: Any, path: str) -> dict:
+    """Validate the parsed YAML shape. Raise ValueError with a clear message
+    on any structural problem so misconfiguration fails fast at load time."""
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path}: top-level must be a mapping of collection-name -> config; "
+            f"got {type(data).__name__}"
+        )
+    for name, meta in data.items():
+        if not isinstance(meta, dict):
+            raise ValueError(
+                f"{path}: collection '{name}' must be a mapping; got {type(meta).__name__}"
+            )
+        if not meta.get("industry"):
+            raise ValueError(
+                f"{path}: collection '{name}' missing required field 'industry'"
+            )
+        variants = meta.get("variants")
+        if not isinstance(variants, list) or not variants:
+            raise ValueError(
+                f"{path}: collection '{name}' must have a non-empty 'variants' list"
+            )
+        for i, v in enumerate(variants):
+            if not isinstance(v, dict):
+                raise ValueError(
+                    f"{path}: collection '{name}' variant #{i} must be a mapping"
+                )
+            if not v.get("site_name"):
+                raise ValueError(
+                    f"{path}: collection '{name}' variant #{i} missing required "
+                    "field 'site_name'"
+                )
+    return data
+
+
+def _load_templates() -> dict:
+    """Load and validate the template registry from TEMPLATES_FILE.
+
+    Behavior:
+      - DUDA_TEMPLATES_FILE explicitly set but points nowhere → raise
+        (misconfiguration must fail fast).
+      - Default templates.yaml missing → warn to stderr and return {} so the
+        server can still start and serve non-template tools.
+      - File exists but is malformed → raise (fail fast).
+    """
+    path = TEMPLATES_FILE
+    if not os.path.exists(path):
+        if os.environ.get("DUDA_TEMPLATES_FILE"):
+            raise FileNotFoundError(
+                f"DUDA_TEMPLATES_FILE points to '{path}' but no such file exists."
+            )
+        print(
+            f"[duda-mcp] No templates file at {path} — starting with empty "
+            "template registry. Create the file and call reload_custom_templates.",
+            file=sys.stderr,
+        )
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            raw = yaml.safe_load(f)
+        except yaml.YAMLError as e:
+            raise ValueError(f"{path}: YAML parse error: {e}") from e
+    return _validate_templates(raw, path)
+
+
+CUSTOM_TEMPLATES: dict[str, dict] = _load_templates()
 
 
 @mcp.tool()
@@ -542,7 +697,8 @@ def list_custom_templates(industry: Optional[str] = None) -> dict:
             return {
                 "message": f"No templates found for industry '{industry}'.",
                 "available_industries": sorted({
-                    str(m["industry"]) for m in CUSTOM_TEMPLATES.values() if "industry" in m
+                    str(m.get("industry", "")) for m in CUSTOM_TEMPLATES.values()
+                    if m.get("industry")
                 }),
                 "templates": {},
             }
@@ -570,6 +726,50 @@ def list_custom_templates(industry: Optional[str] = None) -> dict:
             }
             for name, meta in templates.items()
         },
+    }
+
+
+@mcp.tool()
+def reload_custom_templates() -> dict:
+    """
+    Reload the CUSTOM_TEMPLATES registry from the YAML file (default:
+    templates.yaml next to main.py, overridable via DUDA_TEMPLATES_FILE).
+
+    Call this after editing the YAML file to pick up new templates or new
+    variants without restarting the MCP server. Validation runs on the new
+    file — if it fails, the current in-memory registry is left untouched
+    and the validation error is returned so you can fix and retry.
+
+    Returns:
+        On success:
+          {"success": true, "collections": [...], "total_collections": N,
+           "total_variants": N, "source": "<path>"}
+        On failure (in-memory registry unchanged):
+          {"success": false, "error": "...",
+           "current_collections": [...],
+           "message": "Existing template registry left unchanged."}
+    """
+    try:
+        new_templates = _load_templates()
+    except (FileNotFoundError, ValueError) as e:
+        return {
+            "success": False,
+            "error": f"Failed to reload templates: {e}",
+            "current_collections": list(CUSTOM_TEMPLATES.keys()),
+            "message": "Existing template registry left unchanged.",
+        }
+
+    # In-place mutation so any existing references to CUSTOM_TEMPLATES stay valid.
+    CUSTOM_TEMPLATES.clear()
+    CUSTOM_TEMPLATES.update(new_templates)
+    return {
+        "success": True,
+        "collections": list(CUSTOM_TEMPLATES.keys()),
+        "total_collections": len(CUSTOM_TEMPLATES),
+        "total_variants": sum(
+            len(m.get("variants", [])) for m in CUSTOM_TEMPLATES.values()
+        ),
+        "source": TEMPLATES_FILE,
     }
 
 
@@ -604,7 +804,6 @@ def select_template_variant(
         "Pick the best plumbing template for a high-end urban plumbing company"
         "Which home-care variant suits a pediatric care agency?"
     """
-
     meta = CUSTOM_TEMPLATES.get(collection)
     if not meta:
         return {
@@ -626,25 +825,6 @@ def select_template_variant(
             "reasoning": "Only one variant available in this collection.",
             "total_variants_considered": 1,
         }
-
-    # Build a rich summary of each variant for the selection prompt
-    def _fmt_variant(i: int, v: dict) -> str:
-        lines = [f"Variant {i + 1}: {v.get('name', v['site_name'])}"]
-        if v.get("tagline"):
-            lines.append(f"  Tagline: {v['tagline']}")
-        if v.get("description"):
-            lines.append(f"  Description: {v['description']}")
-        if v.get("design_vibe"):
-            lines.append(f"  Design vibe: {v['design_vibe']}")
-        if v.get("ideal_client"):
-            ic = v["ideal_client"]
-            lines.append("  Ideal client:")
-            for k, val in ic.items():
-                lines.append(f"    {k}: {val}")
-        if v.get("url"):
-            lines.append(f"  Preview: {v['url']}")
-        lines.append(f"  site_name: {v['site_name']}")
-        return "\n".join(lines)
 
     variants_text = "\n\n".join(_fmt_variant(i, v) for i, v in enumerate(variants))
 
@@ -670,44 +850,63 @@ Instructions:
   "reasoning": "<2-3 sentences explaining specifically why this variant fits the client brief>"
 }}"""
 
+    def _fallback(reason: str) -> dict:
+        """Deterministic fallback to the first variant when LLM selection is unavailable."""
+        first = variants[0]
+        return {
+            "selected_site_name": first["site_name"],
+            "selected_variant_name": first.get("name", ""),
+            "selected_variant_id": first.get("id", ""),
+            "collection": collection,
+            "reasoning": f"Fallback to first variant: {reason}",
+            "total_variants_considered": len(variants),
+            "fallback": True,
+        }
+
+    # POST-REVIEW FIX: fail loudly (via visible 'fallback: true' flag) instead of
+    # silently degrading, and skip the API call entirely if there's no key.
+    client = _get_anthropic_client()
+    if client is None:
+        return _fallback("ANTHROPIC_API_KEY not set; using first variant.")
+
     try:
-        _client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
-        message = _client.messages.create(
-            model="claude-sonnet-4-6",
+        message = client.messages.create(
+            model=ANTHROPIC_MODEL,
             max_tokens=500,
             messages=[{"role": "user", "content": prompt}],
         )
-        raw = getattr(message.content[0], "text", "").strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        result = json.loads(raw.strip())
-    except Exception as e:
-        # Fallback to first variant if API call fails
-        return {
-            "selected_site_name": variants[0]["site_name"],
-            "selected_variant_name": variants[0].get("name", ""),
-            "selected_variant_id": variants[0].get("id", ""),
-            "collection": collection,
-            "reasoning": f"Fallback to first variant due to selection error: {e}",
-            "total_variants_considered": len(variants),
-        }
+    except Exception as e:  # noqa: BLE001 — anthropic errors vary; be defensive
+        return _fallback(f"Anthropic API error: {e}")
 
-    # Find the selected variant's full metadata to return
+    if not message.content:
+        return _fallback("Empty response from Anthropic API.")
+
+    raw = getattr(message.content[0], "text", "") or ""
+    try:
+        result = _extract_json_object(raw.strip())
+    except (ValueError, json.JSONDecodeError) as e:
+        return _fallback(f"Could not parse JSON from model response: {e}")
+
+    # POST-REVIEW FIX: resolve to the actual chosen variant's metadata
+    # rather than mixing model output with variants[0] fields.
     selected_meta = next(
         (v for v in variants if v["site_name"] == result.get("selected_site_name")),
-        variants[0],
+        None,
     )
+    if selected_meta is None:
+        return _fallback(
+            f"Model chose site_name={result.get('selected_site_name')!r} which is "
+            f"not in the '{collection}' collection."
+        )
+
     return {
-        "selected_site_name": result.get("selected_site_name"),
+        "selected_site_name": selected_meta["site_name"],
         "selected_variant_name": selected_meta.get("name", ""),
         "selected_variant_id": selected_meta.get("id", ""),
         "collection": collection,
         "reasoning": result.get("reasoning", ""),
         "total_variants_considered": len(variants),
     }
-
 
 
 @mcp.tool()
@@ -795,17 +994,17 @@ def build_site_from_custom_template(
 
     Returns:
         A dict with site_name, edit_url, preview_url, content_injected (bool),
-        and any warnings from the content or publish steps.
+        content_status, and any warnings from the content or publish steps.
 
     Example prompt to Claude Desktop:
         "Build a new plumbing site for Acme Plumbing — domain acme-plumbing,
          phone 555-999-0000, email info@acme.com, city Portland, region OR."
     """
-    # Resolve collection name → best variant site_name ID.
-    # Claude should call select_template_variant() first to get the best
-    # site_name ID for the client brief, then pass it here directly.
-    # If a collection name is passed, we fall back to the first variant.
-    # Raw site_name IDs (not in CUSTOM_TEMPLATES) are used as-is.
+    # Resolve collection name → variant site_name ID.
+    # If a collection with multiple variants is passed here, we fall back to
+    # the first variant AND surface a warning so the caller knows the pick
+    # wasn't deliberate.
+    collection_warning: Optional[str] = None
     template_meta = CUSTOM_TEMPLATES.get(template_site_name)
     if template_meta:
         variants = template_meta.get("variants", [])
@@ -813,34 +1012,19 @@ def build_site_from_custom_template(
             return {
                 "error": f"Template collection '{template_site_name}' has no variants registered.",
             }
-        # Fallback to first variant — Claude should use select_template_variant first
         resolved_template = variants[0]["site_name"]
+        # POST-REVIEW FIX: warn when we silently defaulted to the first of many.
+        if len(variants) > 1:
+            first_name = variants[0].get("name", variants[0]["site_name"])
+            collection_warning = (
+                f"Collection '{template_site_name}' has {len(variants)} variants; "
+                f"defaulted to the first one ('{first_name}'). "
+                f"Call select_template_variant() first for a targeted match."
+            )
     else:
         # Treat as a raw site_name ID (returned by select_template_variant)
         resolved_template = template_site_name
 
-    # ── Step 1: Duplicate the template ──────────────────────────────────────
-    new_site = _call(
-        "POST",
-        f"/sites/multiscreen/duplicate/{resolved_template}",
-        params={"new_default_domain": new_default_domain},
-    )
-    if "_status_code" in new_site:
-        return {
-            "error": "Failed to duplicate template site.",
-            "detail": new_site.get("raw_response", new_site),
-            "_status_code": new_site["_status_code"],
-        }
-
-    # FIX #1: Explicit guard — fail clearly if site_name is missing.
-    new_site_name = new_site.get("site_name")
-    if not new_site_name:
-        return {
-            "error": "Duplicate succeeded but site_name was missing from response.",
-            "raw": new_site,
-        }
-
-    # ── Step 2: Build and inject content payload ─────────────────────────────
     content_payload = _build_content_payload(
         business_name=business_name,
         description=description,
@@ -863,40 +1047,23 @@ def build_site_from_custom_template(
         site_images=site_images,
     )
 
-    content_injected = False
-    content_warning: Optional[str] = None
+    # POST-REVIEW FIX: shared workflow now lives in _duplicate_and_inject
+    result = _duplicate_and_inject(
+        source_site_name=resolved_template,
+        new_default_domain=new_default_domain,
+        content_payload=content_payload,
+        publish_content=publish_content,
+    )
 
-    if content_payload:
-        ok, err = _update_content(new_site_name, content_payload)
-        if ok:
-            content_injected = True
-        else:
-            content_warning = f"Site created but content injection failed: {err}"
+    if result.get("_error"):
+        # Surface the duplicate-step error cleanly
+        result.pop("_error", None)
+        return result
 
-    # ── Step 3: Optionally publish content changes ───────────────────────────
-    publish_warning: Optional[str] = None
-    if publish_content and content_injected:
-        pub_ok, pub_err = _publish_content(new_site_name)
-        if not pub_ok:
-            publish_warning = f"Content injected but publish-content failed: {pub_err}"
-
-    # ── Response ─────────────────────────────────────────────────────────────
-    response: dict = {
-        "site_name": new_site_name,
-        "default_domain": new_site.get("site_default_domain"),
-        "edit_url": f"https://dashboard.duda.co/home/site/{new_site_name}",
-        "preview_url": f"https://dashboard.duda.co/preview/{new_site_name}",
-        "status": "created",
-        "template_source": resolved_template,
-        "content_injected": content_injected,
-        "fields_sent": list(content_payload.keys()) if content_payload else [],
-    }
-    if content_warning:
-        response["content_warning"] = content_warning
-    if publish_warning:
-        response["publish_warning"] = publish_warning
-
-    return response
+    result["template_source"] = resolved_template
+    if collection_warning:
+        result["collection_warning"] = collection_warning
+    return result
 
 
 @mcp.tool()
@@ -1020,44 +1187,27 @@ def create_site_from_existing(
         phone: Optional — pre-fill the phone number.
         email: Optional — pre-fill the email address.
     """
-    new_site = _call(
-        "POST",
-        f"/sites/multiscreen/duplicate/{template_site_name}",
-        params={"new_default_domain": new_default_domain},
+    # POST-REVIEW FIX: reuse the shared _duplicate_and_inject workflow so
+    # this tool and build_site_from_custom_template can't drift apart.
+    content_payload = _build_content_payload(
+        business_name=business_name,
+        phone=phone,
+        email=email,
     )
-    if "_status_code" in new_site:
-        return {"error": new_site.get("raw_response", "Unknown error"), **new_site}
 
-    # FIX #8: Explicit guard — same as build_site_from_custom_template.
-    new_site_name = new_site.get("site_name")
-    if not new_site_name:
-        return {
-            "error": "Duplicate succeeded but site_name was missing from response.",
-            "raw": new_site,
-        }
+    result = _duplicate_and_inject(
+        source_site_name=template_site_name,
+        new_default_domain=new_default_domain,
+        content_payload=content_payload,
+        publish_content=False,
+    )
 
-    content_warning: Optional[str] = None
-    if any([business_name, phone, email]):
-        payload = _build_content_payload(
-            business_name=business_name,
-            phone=phone,
-            email=email,
-        )
-        ok, err = _update_content(new_site_name, payload)
-        if not ok:
-            content_warning = f"Site created but content update failed: {err}"
+    if result.get("_error"):
+        result.pop("_error", None)
+        return result
 
-    response: dict = {
-        "site_name": new_site_name,
-        "default_domain": new_site.get("site_default_domain"),
-        "edit_url": f"https://dashboard.duda.co/home/site/{new_site_name}",
-        "preview_url": f"https://dashboard.duda.co/preview/{new_site_name}",
-        "status": "created",
-        "template_source": template_site_name,
-    }
-    if content_warning:
-        response["content_update_warning"] = content_warning
-    return response
+    result["template_source"] = template_site_name
+    return result
 
 
 # --- CLIENT / CONTENT COLLECTION --------------------------------------------
@@ -1088,11 +1238,19 @@ def create_client_account(
 
     result = _call("POST", "/accounts/create", json=payload)
 
-    # FIX #4: If account already exists (400), still proceed to grant permissions.
+    # FIX #4 (revised): only treat this as "already exists" when the response
+    # actually signals that. Blindly proceeding on every 400 hid real validation
+    # errors and could grant permissions on non-existent accounts.
     if "_status_code" in result:
-        if result.get("_status_code") != 400:
+        status = result.get("_status_code")
+        body_str = json.dumps(result, default=str).lower()
+        already_exists = (
+            status == 409  # conflict — the canonical "already exists" signal
+            or (status == 400 and ("already" in body_str or "exist" in body_str))
+        )
+        if not already_exists:
             return {"error": "Failed to create client account.", "detail": result}
-        # 400 = account already exists — safe to continue to permissions step
+        # Account already exists — safe to continue to permissions step.
 
     # Step 2: Grant content collection permissions
     perms = _call(
@@ -1207,6 +1365,11 @@ def create_blog_post(
         body: HTML content of the blog post.
         status: 'DRAFT' (default) or 'PUBLISHED'.
     """
+    # POST-REVIEW FIX: Literal is a hint, not a runtime check — validate.
+    if status not in ("DRAFT", "PUBLISHED"):
+        return {
+            "error": f"Invalid status '{status}'. Must be 'DRAFT' or 'PUBLISHED'.",
+        }
     return _call(
         "POST",
         f"/sites/multiscreen/{site_name}/blog/posts",

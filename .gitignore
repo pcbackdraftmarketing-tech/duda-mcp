@@ -1,12 +1,29 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
+# Secrets
 .env
+.env.*
+*.env
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+
+# Editor
 .vscode/
+.idea/
+
+# Sensitive data
+sites.json
+
+# Lock files (optional - remove this line if you want to track uv.lock)
+uv.lock
+
+# OS
+.DS_Store
+Thumbs.db
