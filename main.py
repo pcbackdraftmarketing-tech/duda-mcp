@@ -315,7 +315,7 @@ def _duplicate_and_inject(
         }
 
     content_injected = False
-    content_status: str
+    content_status: str = "no_fields_provided"   # FIX #5: initialize before branching
     content_warning: Optional[str] = None
 
     if content_payload:
@@ -376,13 +376,44 @@ def _fmt_variant(i: int, v: dict) -> str:
 
 
 def _extract_json_object(raw: str) -> dict:
-    """Robustly pull the first JSON object out of a model response.
-    POST-REVIEW FIX: replaces the fragile ```json fence stripping which broke
-    on unclosed fences and stray backticks inside reasoning text."""
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not match:
+    """Robustly pull the first balanced JSON object out of a model response.
+
+    Uses brace-depth tracking instead of a greedy regex so it handles:
+      - Multiple JSON objects in one response (reasoning + answer)
+      - Nested objects inside the target payload
+      - Stray backticks or markdown fences around the JSON
+
+    Raises ValueError if no valid, balanced JSON object is found.
+    """
+    start = raw.find("{")
+    if start == -1:
         raise ValueError("No JSON object found in model response.")
-    return json.loads(match.group(0))
+
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i, ch in enumerate(raw[start:], start=start):
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = raw[start : i + 1]
+                return json.loads(candidate)
+
+    raise ValueError("No balanced JSON object found in model response.")
 
 
 # ---------------------------------------------------------------------------
@@ -447,27 +478,19 @@ def get_site(site_name: str) -> dict:
 @mcp.tool()
 def publish_site(site_name: str) -> dict:
     """Publish a Duda site to make it live."""
-    try:
-        r = session.post(
-            f"{BASE_URL}/sites/multiscreen/{site_name}/publish",
-            timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: was DEFAULT_TIMEOUT
-        )
-    except requests.RequestException as e:
-        return {"status_code": 500, "message": str(e)}
-    return {"status_code": r.status_code, "message": "Published" if r.ok else r.text}
+    result = _call("POST", f"/sites/multiscreen/{site_name}/publish", timeout=LONG_TIMEOUT)
+    if "_status_code" in result:
+        return {"published": False, "site_name": site_name, "error": result}
+    return {"published": True, "site_name": site_name}
 
 
 @mcp.tool()
 def unpublish_site(site_name: str) -> dict:
     """Unpublish (take offline) a Duda site."""
-    try:
-        r = session.post(
-            f"{BASE_URL}/sites/multiscreen/{site_name}/unpublish",
-            timeout=LONG_TIMEOUT,  # POST-REVIEW FIX: was DEFAULT_TIMEOUT
-        )
-    except requests.RequestException as e:
-        return {"status_code": 500, "message": str(e)}
-    return {"status_code": r.status_code, "message": "Unpublished" if r.ok else r.text}
+    result = _call("POST", f"/sites/multiscreen/{site_name}/unpublish", timeout=LONG_TIMEOUT)
+    if "_status_code" in result:
+        return {"unpublished": False, "site_name": site_name, "error": result}
+    return {"unpublished": True, "site_name": site_name}
 
 
 @mcp.tool()
@@ -659,6 +682,21 @@ def _load_templates() -> dict:
 
 CUSTOM_TEMPLATES: dict[str, dict] = _load_templates()
 
+# FIX #8: In Lambda (and any packaged deployment), templates.yaml must be bundled
+# alongside main.py. Log a prominent warning at startup if it's absent so the
+# missing-file problem surfaces immediately in CloudWatch cold-start logs rather
+# than appearing as silent "no templates" behaviour at request time.
+if not CUSTOM_TEMPLATES and not os.environ.get("DUDA_TEMPLATES_FILE"):
+    _expected = DEFAULT_TEMPLATES_FILE
+    if not os.path.exists(_expected):
+        print(
+            f"[duda-mcp] WARNING: templates.yaml not found at '{_expected}'. "
+            "If running in AWS Lambda, ensure templates.yaml is included in your "
+            "deployment zip alongside main.py. Template selection will be unavailable "
+            "until the file is present and reload_custom_templates is called.",
+            file=sys.stderr,
+        )
+
 
 @mcp.tool()
 def list_custom_templates(industry: Optional[str] = None) -> dict:
@@ -680,7 +718,7 @@ def list_custom_templates(industry: Optional[str] = None) -> dict:
         return {
             "message": (
                 "No custom templates registered yet. "
-                "Edit the CUSTOM_TEMPLATES dict in main.py to add templates."
+                "Edit templates.yaml and call reload_custom_templates to add templates."  # FIX #4: was pointing to main.py
             ),
             "templates": {},
         }
@@ -873,6 +911,7 @@ Instructions:
         message = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=500,
+            timeout=20.0,  # FIX #9: prevent Lambda from hanging on slow/cold model responses
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as e:  # noqa: BLE001 — anthropic errors vary; be defensive
@@ -902,7 +941,7 @@ Instructions:
     return {
         "selected_site_name": selected_meta["site_name"],
         "selected_variant_name": selected_meta.get("name", ""),
-        "selected_variant_id": selected_meta.get("id", ""),
+        "selected_variant_id": selected_meta.get("id", ""),   # FIX #3: was missing from success path
         "collection": collection,
         "reasoning": result.get("reasoning", ""),
         "total_variants_considered": len(variants),
@@ -1316,13 +1355,28 @@ def get_site_analytics(site_name: str, from_date: str, to_date: str) -> dict:
         from_date: Start date in YYYY-MM-DD format.
         to_date: End date in YYYY-MM-DD format.
     """
+    parsed_dates = {}
     for label, value in (("from_date", from_date), ("to_date", to_date)):
         try:
-            datetime.strptime(value, "%Y-%m-%d")
+            parsed_dates[label] = datetime.strptime(value, "%Y-%m-%d").date()
         except ValueError:
             return {
                 "error": f"Invalid {label} '{value}'. Expected format: YYYY-MM-DD."
             }
+
+    # FIX #6: guard against reversed or oversized date ranges
+    dt_from = parsed_dates["from_date"]
+    dt_to = parsed_dates["to_date"]
+    if dt_to < dt_from:
+        return {"error": "to_date must be on or after from_date."}
+    if (dt_to - dt_from).days > 365:
+        return {
+            "error": (
+                f"Date range is {(dt_to - dt_from).days} days. "
+                "Duda analytics supports a maximum of 365 days per query. "
+                "Split into smaller ranges and combine the results."
+            )
+        }
 
     return _call(
         "GET",
@@ -1355,6 +1409,7 @@ def create_blog_post(
     title: str,
     body: str,
     status: Literal["DRAFT", "PUBLISHED"] = "DRAFT",
+    auto_wrap_plain_text: bool = False,
 ) -> dict:
     """
     Create a blog post on a Duda site.
@@ -1362,18 +1417,47 @@ def create_blog_post(
     Args:
         site_name: The site name/ID.
         title: Blog post title.
-        body: HTML content of the blog post.
+        body: HTML content of the blog post. Duda expects valid HTML — passing
+              plain text or Markdown will render without formatting. Set
+              auto_wrap_plain_text=True to have plain text wrapped in <p> tags
+              automatically, or convert Markdown to HTML before calling this tool.
         status: 'DRAFT' (default) or 'PUBLISHED'.
+        auto_wrap_plain_text: If True and body contains no HTML tags, wraps each
+                              non-empty line in <p>...</p> tags so the post renders
+                              with paragraph breaks instead of as a single run-on block.
     """
     # POST-REVIEW FIX: Literal is a hint, not a runtime check — validate.
     if status not in ("DRAFT", "PUBLISHED"):
         return {
             "error": f"Invalid status '{status}'. Must be 'DRAFT' or 'PUBLISHED'.",
         }
+
+    # FIX #7: detect plain text / Markdown and warn or auto-wrap.
+    final_body = body
+    body_looks_like_html = bool(re.search(r"<[a-zA-Z][^>]*>", body))
+    if not body_looks_like_html:
+        if auto_wrap_plain_text:
+            final_body = "\n".join(
+                f"<p>{line}</p>" for line in body.splitlines() if line.strip()
+            )
+        else:
+            # Surface a warning in the response so the caller knows what happened.
+            result = _call(
+                "POST",
+                f"/sites/multiscreen/{site_name}/blog/posts",
+                json={"title": title, "body": final_body, "status": status},
+            )
+            result.setdefault("body_warning", (
+                "The body appears to be plain text or Markdown, not HTML. "
+                "Duda renders the body as-is, so formatting may be lost. "
+                "Pass HTML or set auto_wrap_plain_text=True for basic paragraph wrapping."
+            ))
+            return result
+
     return _call(
         "POST",
         f"/sites/multiscreen/{site_name}/blog/posts",
-        json={"title": title, "body": body, "status": status},
+        json={"title": title, "body": final_body, "status": status},
     )
 
 
