@@ -1404,6 +1404,169 @@ def list_blog_posts(site_name: str) -> dict:
 
 
 @mcp.tool()
+def create_blog(site_name: str) -> dict:
+    """
+    Initialize (enable) the blog feature on a Duda site.
+
+    Must be called once before create_blog_post will work on a site that
+    has never had a blog. Duda returns 405 on create_blog_post if the blog
+    page does not exist yet — call this first to create it.
+
+    Args:
+        site_name: The site name/ID.
+    """
+    try:
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{site_name}/blog",
+            json={},
+            timeout=LONG_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"error": str(e), "_status_code": 500}
+
+    if r.ok:
+        return {
+            "success": True,
+            "site_name": site_name,
+            "message": "Blog created successfully. You can now create blog posts on this site.",
+        }
+
+    # 409 Conflict OR 400 ResourceAlreadyExist — Duda is inconsistent, both mean blog exists
+    if r.status_code == 409:
+        return {
+            "success": True,
+            "site_name": site_name,
+            "message": "Blog already exists on this site. Ready to create posts.",
+        }
+
+    try:
+        err_body = r.json()
+    except ValueError:
+        err_body = r.text
+
+    if r.status_code == 400 and isinstance(err_body, dict) and err_body.get("error_code") == "ResourceAlreadyExist":
+        return {
+            "success": True,
+            "site_name": site_name,
+            "message": "Blog already exists on this site. Ready to create posts.",
+        }
+
+    return {
+        "success": False,
+        "error": f"Failed to create blog. HTTP {r.status_code}: {err_body}",
+        "_status_code": r.status_code,
+    }
+
+
+@mcp.tool()
+def import_blog_post(
+    site_name: str,
+    title: str,
+    body: str,
+    description: Optional[str] = None,
+    author: Optional[str] = None,
+    image_url: Optional[str] = None,
+    image_alt: Optional[str] = None,
+) -> dict:
+    """
+    Import a single blog post and append it to an existing site blog.
+    Posts are always created in DRAFT mode — publish manually in the Duda
+    editor or call publish_blog_post after this.
+
+    Use this as an alternative to create_blog_post if that endpoint returns
+    405. Both write to the same blog; import is more permissive about the
+    blog's initialization state.
+
+    Duda's import endpoint requires (per the official API reference):
+      - content:     base64 encoding of the HTML body  (NOT raw HTML)
+      - description: a short summary of the post
+      - title:       max 200 chars
+    Optional: author (max 200 chars), main_image, thumbnail.
+
+    Args:
+        site_name:   The site name/ID.
+        title:       Blog post title (truncated to 200 chars).
+        body:        HTML content of the blog post (base64-encoded before send).
+        description: Short summary. If omitted, derived from the body text.
+        author:      Optional author display name (truncated to 200 chars).
+        image_url:   Optional URL for the post header image (main_image).
+        image_alt:   Optional alt text for the image.
+    """
+    # content must be a base64 encoding of the HTML, per Duda's API reference.
+    content_b64 = base64.b64encode(body.encode("utf-8")).decode("ascii")
+
+    # description is required; derive a plain-text snippet from the body if absent.
+    if not description:
+        plain = re.sub(r"<[^>]+>", " ", body)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        description = (plain[:157] + "...") if len(plain) > 160 else plain
+        if not description:
+            description = title
+
+    payload: dict = {
+        "title": title[:200],
+        "content": content_b64,
+        "description": description,
+    }
+    if author:
+        payload["author"] = author[:200]
+    if image_url:
+        # main_image is an object per the API reference.
+        payload["main_image"] = {"url": image_url}
+        if image_alt:
+            payload["main_image"]["alt"] = image_alt
+
+    result = _call(
+        "POST",
+        f"/sites/multiscreen/{site_name}/blog/posts/import",
+        json=payload,
+        timeout=LONG_TIMEOUT,
+    )
+
+    if "_status_code" not in result:
+        result.setdefault("note", (
+            "Post imported as DRAFT. Publish it manually in the Duda editor "
+            "or call publish_blog_post with the returned post id."
+        ))
+    return result
+
+
+@mcp.tool()
+def publish_blog_post(site_name: str, post_id: str) -> dict:
+    """
+    Publish a blog post that is currently in DRAFT status.
+
+    Args:
+        site_name: The site name/ID.
+        post_id:   The blog post ID (returned by list_blog_posts or import_blog_post).
+    """
+    try:
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{site_name}/blog/posts/{post_id}/publish",
+            timeout=LONG_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"error": str(e), "_status_code": 500}
+
+    if r.ok:
+        return {
+            "success": True,
+            "site_name": site_name,
+            "post_id": post_id,
+            "message": "Blog post published successfully.",
+        }
+    try:
+        err_body = r.json()
+    except ValueError:
+        err_body = r.text
+    return {
+        "success": False,
+        "error": f"Failed to publish post. HTTP {r.status_code}: {err_body}",
+        "_status_code": r.status_code,
+    }
+
+
+@mcp.tool()
 def create_blog_post(
     site_name: str,
     title: str,
@@ -1484,6 +1647,218 @@ def get_content_library(site_name: str) -> dict:
 def list_client_accounts(site_name: str) -> dict:
     """List all client accounts (permissions) for a Duda site."""
     return _call("GET", f"/accounts/client/{site_name}")
+
+
+# --- SITE VERSION -----------------------------------------------------------
+
+
+@mcp.tool()
+def get_site_version(site_name: str) -> dict:
+    """
+    Check whether a Duda site is on the Classic editor or Editor 2.0.
+    Call this BEFORE creating blog posts to decide which approach to use.
+
+    Duda's Get Site response exposes an `editor` field:
+      - "ADVANCED" or "ADVANCED-2.0"  -> Editor 2.0
+      - anything else                  -> Classic editor
+
+    NOTE: Duda may return either "ADVANCED" or "ADVANCED-2.0" for Editor 2.0
+    sites depending on account/plan. Both are treated as 2.0 here. The raw
+    value is always returned as `editor_raw` for verification.
+
+    Returns 'CLASSIC' or '2.0' in the editor_version field.
+    """
+    result = _call("GET", f"/sites/multiscreen/{site_name}")
+
+    if "_status_code" in result:
+        status = result["_status_code"]
+        if status == 404:
+            return {
+                "success": False,
+                "site_name": site_name,
+                "error": f"Site '{site_name}' not found. Check the site_name and try again.",
+                "_status_code": status,
+            }
+        if status == 401:
+            return {
+                "success": False,
+                "site_name": site_name,
+                "error": "Unauthorized. Check your Duda API credentials.",
+                "_status_code": status,
+            }
+        return {
+            "success": False,
+            "site_name": site_name,
+            "error": "Could not retrieve site info.",
+            "detail": result,
+            "_status_code": status,
+        }
+
+    editor = result.get("editor", "")
+    if not editor:
+        return {
+            "success": False,
+            "site_name": site_name,
+            "error": "Site response did not include an editor field. Cannot determine version.",
+            "editor_raw": editor,
+        }
+
+    return {
+        "success": True,
+        "site_name": site_name,
+        "editor_version": "2.0" if editor in ("ADVANCED", "ADVANCED-2.0") else "CLASSIC",
+        "editor_raw": editor,
+    }
+
+
+@mcp.tool()
+def update_blog_post(
+    site_name: str,
+    post_id: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    author_name: Optional[str] = None,
+    meta_title: Optional[str] = None,
+    path: Optional[str] = None,
+    no_index: Optional[bool] = None,
+    publish_date: Optional[str] = None,
+    schedule_publish_date: Optional[str] = None,
+    tags: Optional[list[str]] = None,
+) -> dict:
+    """
+    Update METADATA on an existing blog post (Duda PATCH endpoint).
+
+    IMPORTANT — what this endpoint CANNOT do:
+      * It does NOT edit the post body/content. To change body content you must
+        delete the post (delete_blog_post) and re-import it (import_blog_post).
+      * It does NOT change DRAFT/PUBLISHED status. Use publish_blog_post /
+        unpublish_blog_post for that.
+
+    Supported fields (only provided values are sent):
+        title:                  Post title.
+        description:            Short summary / excerpt.
+        author_name:            Author display name (NOTE: 'author_name', not 'author').
+        meta_title:             SEO meta title.
+        path:                   URL slug / path for the post.
+        no_index:               True to add noindex to the post.
+        tags:                   List of tag strings.
+        publish_date:           Display date (ISO 8601). Does NOT publish.
+        schedule_publish_date:  Schedules publishing (ISO 8601).
+
+    Args:
+        site_name: The site name/ID.
+        post_id:   The blog post ID (from list_blog_posts / import_blog_post).
+    """
+    payload: dict = {}
+    if title is not None:
+        payload["title"] = title
+    if description is not None:
+        payload["description"] = description
+    if author_name is not None:
+        payload["author_name"] = author_name
+    if meta_title is not None:
+        payload["meta_title"] = meta_title
+    if path is not None:
+        payload["path"] = path
+    if no_index is not None:
+        payload["no_index"] = no_index
+    if publish_date is not None:
+        payload["publish_date"] = publish_date
+    if schedule_publish_date is not None:
+        payload["schedule_publish_date"] = schedule_publish_date
+    if tags is not None:
+        payload["tags"] = tags
+
+    if not payload:
+        return {"message": "No update parameters were provided. Post remains unchanged."}
+
+    result = _call(
+        "PATCH",
+        f"/sites/multiscreen/{site_name}/blog/posts/{post_id}",
+        json=payload,
+        timeout=LONG_TIMEOUT,
+    )
+    if not result or "_status_code" in result:
+        return {
+            "error": f"Failed to update blog post {post_id}.",
+            "detail": result if result else "No response from Duda API server.",
+        }
+    result.setdefault("success", True)
+    result.setdefault("fields_updated", list(payload.keys()))
+    return result
+
+
+@mcp.tool()
+def unpublish_blog_post(site_name: str, post_id: str) -> dict:
+    """
+    Unpublish a blog post, returning it to DRAFT status.
+    Pairs with publish_blog_post. Use this to take a live post offline,
+    since update_blog_post cannot change publish status.
+
+    Args:
+        site_name: The site name/ID.
+        post_id:   The blog post ID.
+    """
+    try:
+        r = session.post(
+            f"{BASE_URL}/sites/multiscreen/{site_name}/blog/posts/{post_id}/unpublish",
+            timeout=LONG_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        return {"error": str(e), "_status_code": 500}
+
+    if r.ok:
+        return {
+            "success": True,
+            "site_name": site_name,
+            "post_id": post_id,
+            "message": "Blog post unpublished (returned to DRAFT).",
+        }
+    try:
+        err_body = r.json()
+    except ValueError:
+        err_body = r.text
+    return {
+        "success": False,
+        "error": f"Failed to unpublish post. HTTP {r.status_code}: {err_body}",
+        "_status_code": r.status_code,
+    }
+
+
+@mcp.tool()
+def delete_blog_post(site_name: str, post_id: str) -> dict:
+    """
+    Permanently delete a blog post. Cannot be undone.
+
+    Because Duda's update endpoint cannot edit post body content, the supported
+    way to "edit" content is: delete_blog_post then import_blog_post with the
+    corrected HTML.
+
+    Args:
+        site_name: The site name/ID.
+        post_id:   The blog post ID (from list_blog_posts).
+    """
+    result = _call(
+        "DELETE",
+        f"/sites/multiscreen/{site_name}/blog/posts/{post_id}",
+        timeout=LONG_TIMEOUT,
+    )
+    if "_status_code" in result:
+        return {"deleted": False, "site_name": site_name, "post_id": post_id, "error": result}
+    return {"deleted": True, "site_name": site_name, "post_id": post_id}
+
+
+@mcp.tool()
+def get_blog_post(site_name: str, post_id: str) -> dict:
+    """
+    Retrieve a single blog post by ID, to verify what was pushed
+    (title, status, path, body, etc.).
+
+    Args:
+        site_name: The site name/ID.
+        post_id:   The blog post ID (from list_blog_posts).
+    """
+    return _call("GET", f"/sites/multiscreen/{site_name}/blog/posts/{post_id}")
 
 
 # ---------------------------------------------------------------------------
